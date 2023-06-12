@@ -1,0 +1,266 @@
+import torch
+import torch.nn as nn
+from torch.utils.data import DataLoader
+import torchvision.models as models
+import torchvision.transforms.functional as VF
+from torchvision import transforms
+import copy
+import sys, argparse, os, glob
+import pandas as pd
+import numpy as np
+from PIL import Image
+from collections import OrderedDict
+from skimage import exposure, io, img_as_ubyte, transform
+import warnings
+from nystrom.nystrom_attention import Nystromformer
+import json
+import datetime
+from sklearn.utils import shuffle
+from torch.autograd import Variable
+import pickle
+
+from sklearn.metrics import roc_curve, roc_auc_score, precision_recall_fscore_support
+
+b = 1
+m = 1-b
+
+class BagDataset():
+    def __init__(self, csv_file, transform=None):
+        self.files_list = csv_file
+        self.transform = transform
+    def __len__(self):
+        return len(self.files_list)
+    def __getitem__(self, idx):
+        path = self.files_list[idx]
+        img = Image.open(path)
+        img_name = path.split(os.sep)[-1]
+        img_pos = np.asarray([int(img_name.split('.')[0].split('_')[0]), int(img_name.split('.')[0].split('_')[1])]) # row, col
+        sample = {'input': img, 'position': img_pos}
+        
+        if self.transform:
+            sample = self.transform(sample)
+        return sample 
+
+class ToTensor(object):
+    def __call__(self, sample):
+        img = sample['input']
+        img = VF.to_tensor(img)
+        sample['input'] = img
+        return sample
+    
+class Compose(object):
+    def __init__(self, transforms):
+        self.transforms = transforms
+
+    def __call__(self, img):
+        for t in self.transforms:
+            img = t(img)
+        return img
+    
+def multi_label_roc(labels, predictions, num_classes, pos_label=1):
+    fprs = []
+    tprs = []
+    thresholds = []
+    thresholds_optimal = []
+    aucs = []
+    if len(predictions.shape)==1:
+        predictions = predictions[:, None]
+    for c in range(0, num_classes):
+        label = labels[:, c]
+        prediction = predictions[:, c]
+        fpr, tpr, threshold = roc_curve(label, prediction, pos_label=1)
+        fpr_optimal, tpr_optimal, threshold_optimal = optimal_thresh(fpr, tpr, threshold)
+        c_auc = roc_auc_score(label, prediction)
+        aucs.append(c_auc)
+        thresholds.append(threshold)
+        thresholds_optimal.append(threshold_optimal)
+    return aucs, thresholds, thresholds_optimal, fpr, tpr
+
+def optimal_thresh(fpr, tpr, thresholds, p=0):
+    loss = (fpr - tpr) - p * tpr / (fpr + tpr + 1)
+    idx = np.argmin(loss, axis=0)
+    return fpr[idx], tpr[idx], thresholds[idx]
+
+def bag_dataset(args, csv_file_path):
+    transformed_dataset = BagDataset(csv_file=csv_file_path,
+                                    transform=Compose([
+                                        ToTensor()
+                                    ]))
+    dataloader = DataLoader(transformed_dataset, batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers, drop_last=False)
+    return dataloader, len(transformed_dataset)
+
+def get_bag_feats(csv_file_df, args):
+    if args.dataset == 'TCGA-lung-default':
+        feats_csv_path = 'datasets/tcga-dataset/tcga_lung_data_feats/' + csv_file_df.iloc[0].split('/')[1] + '.csv'
+    else:
+        feats_csv_path = csv_file_df.iloc[0]
+    df = pd.read_csv(feats_csv_path)
+    feats = shuffle(df).reset_index(drop=True)
+    feats = feats.to_numpy()
+    label = np.zeros(args.num_classes)
+    if args.num_classes==1:
+        label[0] = csv_file_df.iloc[1]
+    else:
+        if int(csv_file_df.iloc[1])<=(len(label)-1):
+            label[int(csv_file_df.iloc[1])] = 1
+        
+    return label, feats
+
+def test(args, test_df, milnet):
+    b_loss = args.b_loss
+    m_loss = 1-b_loss
+    
+    score = {}
+    milnet.eval()
+    
+    test_labels = []
+    test_predictions = []
+    Tensor = torch.cuda.FloatTensor
+    csvs = shuffle(test_df).reset_index(drop=True)
+    #Tensor = torch.FloatTensor
+    with torch.no_grad():
+        for i in range(len(test_df)):
+            try:
+                print(test_df.iloc[i].iloc[0])
+                label, feats = get_bag_feats(test_df.iloc[i], args)
+    
+                bag_label = Variable(Tensor([label]))
+                bag_feats = Variable(Tensor([feats]))
+                bag_feats = bag_feats.view(-1, args.feats_size)
+                ins_prediction, bag_prediction, _, _ = milnet(bag_feats)
+                max_prediction, _ = torch.max(ins_prediction, 0)  
+                del ins_prediction
+                bag_prediction = torch.sigmoid(bag_prediction).squeeze().cpu().numpy()
+                max_prediction = torch.sigmoid(max_prediction).squeeze().cpu().numpy()
+                
+                print(max_prediction)
+                print(bag_prediction)
+                bag_prediction = m_loss*max_prediction+b_loss*bag_prediction
+                print(bag_prediction)
+                test_labels.extend([label])
+                test_predictions.extend([bag_prediction])
+
+            except Exception as e:
+                print(e)
+                print('err: ' + test_df.iloc[i].iloc[0])
+
+    test_labels = np.array(test_labels)
+    test_predictions = np.array(test_predictions)
+    auc_value, _, thresholds_optimal, fpr, tpr = multi_label_roc(test_labels, test_predictions, args.num_classes, pos_label=1)
+    if args.num_classes==1:
+        class_prediction_bag = copy.deepcopy(test_predictions)
+        class_prediction_bag[test_predictions>=thresholds_optimal[0]] = 1
+        class_prediction_bag[test_predictions<thresholds_optimal[0]] = 0
+        test_predictions = class_prediction_bag
+        test_labels = np.squeeze(test_labels)
+    bag_score = 0
+    for i in range(0, len(test_predictions)):
+        bag_score = np.array_equal(test_labels[i], test_predictions[i]) + bag_score         
+    avg_score = bag_score / len(test_predictions)  
+    
+    print('acc: ' + str(avg_score))
+    print('auc: ' + str(auc_value))
+    print('threshold: ' + str(thresholds_optimal))
+
+    with open('tcga_' + args.model + '_'  + args.postfix + '.pickle','wb') as p:
+        pickle.dump([fpr,tpr], p)
+
+    return avg_score, auc_value, thresholds_optimal  
+            
+   
+if __name__ == '__main__':
+    parser = argparse.ArgumentParser(description='Testing workflow includes attention computing and color map production')
+    parser.add_argument('--num_classes', type=int, default=1, help='Number of output classes')
+    parser.add_argument('--batch_size', type=int, default=64, help='Batch size of feeding patches')
+    parser.add_argument('--num_workers', type=int, default=0)
+    parser.add_argument('--feats_size', type=int, default=512)
+    parser.add_argument('--thres_luad', type=float, default=0.7371)
+    parser.add_argument('--thres_lusc', type=float, default=0.2752)
+    parser.add_argument('--aggr_weight', type=str, default=None)
+    parser.add_argument('--store_dir', type=str, default=None)
+    parser.add_argument('--model', type=str, default='vit')
+    parser.add_argument('--patch', type=str, default='test_patches/patches/')
+    parser.add_argument('--postfix', type=str, default='0')
+    parser.add_argument('--b_loss', type=float, default=0.9)
+    parser.add_argument('--dataset', type=str, default='TCGA')
+    parser.add_argument('--num_head', default=2, type=int)
+    parser.add_argument('--num_block', default=2, type=int)
+    parser.add_argument('--num_landmark', default=256, type=int)
+    parser.add_argument('--with_pos', type=str, default=0)
+
+    args = parser.parse_args()
+    
+    resnet = models.resnet18(pretrained=False, norm_layer=nn.InstanceNorm2d)
+    for param in resnet.parameters():
+        param.requires_grad = False
+    resnet.fc = nn.Identity()
+    
+    if args.model == 'vit':
+        if args.with_pos == '1':
+            import dsmil_efficient_vit_with_pos as mil
+            print('with pos')
+        else:
+            import dsmil_efficient_vit as mil
+            print('without pos')
+
+        from nystrom_attention import Nystromformer
+
+        efficient_transformer = Nystromformer(dim = args.feats_size,
+                                          depth = args.num_block,
+                                          heads = args.num_head,
+                                          num_landmarks = args.num_landmark)
+
+        b_classifier = mil.ViT_1d( num_classes = args.num_classes,
+                            dim = args.feats_size,
+                            transformer = efficient_transformer).cuda()   
+    
+    elif args.model == 'origin':
+        import dsmil as mil
+        b_classifier = mil.BClassifier(input_size=args.feats_size, output_class=args.num_classes).cuda()
+
+    
+    i_classifier = mil.FCLayer(in_size=args.feats_size, out_size=args.num_classes).cuda()
+    #i_classifier = mil.IClassifier(resnet, args.feats_size, output_class=args.num_classes).cuda()
+    
+    milnet = mil.MILNet(i_classifier, b_classifier).cuda()
+    '''
+    state_dict_weights = torch.load(os.path.join('test', 'weights', 'embedder.pth'))
+    
+    new_state_dict = OrderedDict()
+    
+    for i in range(4):
+        state_dict_weights.popitem()
+        
+    state_dict_init = i_classifier.state_dict()
+        
+    for k,v in state_dict_weights.items():
+        print(k)
+
+    print('-----------------------------')
+    for k,v in state_dict_init.items():
+        print(k)
+        
+    for (k, v), (k_0, v_0) in zip(state_dict_weights.items(), state_dict_init.items()):
+        name = k_0
+        new_state_dict[name] = v
+    i_classifier.load_state_dict(new_state_dict, strict=False)
+    '''
+    state_dict_weights = torch.load(args.aggr_weight)
+    '''
+    for k,v in state_dict_weights.items():
+        print(k)
+
+    print('-----------------------------')
+    for k,v in milnet.state_dict().items():
+        print(k)
+    '''
+    state_dict_weights["i_classifier.fc.weight"] = state_dict_weights["i_classifier.fc.0.weight"]
+    state_dict_weights["i_classifier.fc.bias"] = state_dict_weights["i_classifier.fc.0.bias"]
+    milnet.load_state_dict(state_dict_weights, strict=False)
+    
+    bags_csv = os.path.join('datasets', args.dataset, args.dataset+'.csv')        
+    bags_path = pd.read_csv(bags_csv)
+    test_path = bags_path.iloc[0:,:]
+    
+    os.makedirs(os.path.join(args.store_dir, 'output'), exist_ok=True)
+    test(args, test_path, milnet)
